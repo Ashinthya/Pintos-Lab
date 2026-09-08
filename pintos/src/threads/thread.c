@@ -237,6 +237,26 @@ thread_sleep (int64_t wakeup_tick)
   /* Restore the original interrupt state when this thread is awoken. */
   intr_set_level (old_level);
 }
+/* Checks sleep_list and unblocks any threads whose wakeup_tick
+   has been reached. Called every tick by the timer interrupt. */
+void
+thread_wakeup (int64_t current_ticks)
+{
+  while (!list_empty (&sleep_list))
+    {
+      struct thread *t = list_entry (list_front (&sleep_list),
+                                     struct thread, elem);
+
+      /* Because sleep_list is sorted, if the earliest thread 
+         isn't ready yet, none of the threads behind it are! */
+      if (t->wakeup_tick > current_ticks)
+        break;
+
+      /* Remove from sleep_list and move to ready_list */
+      list_pop_front (&sleep_list);
+      thread_unblock (t);
+    }
+}
 
 /* Puts the current thread to sleep.  It will not be scheduled
    again until awoken by thread_unblock().
