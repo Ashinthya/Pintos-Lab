@@ -1,0 +1,7 @@
+# Personal roadmap and notes
+[Pp]roject1_[Tt]hr*ads_[Rr]oadmap*
+Project1_Threads_Roadmap.md
+
+# Build artifacts
+pintos/src/*/build/
+*.bak
