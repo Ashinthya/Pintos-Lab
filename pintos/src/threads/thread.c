@@ -27,7 +27,7 @@ static struct list ready_list;
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
-
+static struct list sleep_list;
 /* Idle thread. */
 static struct thread *idle_thread;
 
@@ -71,6 +71,16 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+
+static bool
+wakeup_tick_less (const struct list_elem *a,
+                  const struct list_elem *b,
+                  void *aux UNUSED)
+{
+  const struct thread *thread_a = list_entry (a, struct thread, elem);
+  const struct thread *thread_b = list_entry (b, struct thread, elem);
+  return thread_a->wakeup_tick < thread_b->wakeup_tick;
+}
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -92,6 +102,8 @@ thread_init (void)
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
+
+  list_init(&sleep_list);
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
@@ -202,6 +214,28 @@ thread_create (const char *name, int priority,
   thread_unblock (t);
 
   return tid;
+}
+
+/* Puts the current running thread to sleep until WAKEUP_TICK.
+   The thread is placed into sleep_list and blocked. */
+void
+thread_sleep (int64_t wakeup_tick)
+{
+  struct thread *cur = thread_current ();
+  enum intr_level old_level;
+
+  /* Must not be called from an interrupt handler! */
+  ASSERT (!intr_context ());
+
+  /* Atomically record the tick, insert into sleep_list, and block. */
+  old_level = intr_disable ();
+
+  cur->wakeup_tick = wakeup_tick;
+  list_insert_ordered (&sleep_list, &cur->elem, wakeup_tick_less, NULL);
+  thread_block ();
+
+  /* Restore the original interrupt state when this thread is awoken. */
+  intr_set_level (old_level);
 }
 
 /* Puts the current thread to sleep.  It will not be scheduled
