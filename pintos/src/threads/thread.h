@@ -125,6 +125,10 @@ void thread_sleep (int64_t wakeup_tick);
 
 void thread_wakeup (int64_t current_ticks);
 
+bool priority_greater (const struct list_elem *a, const struct list_elem *b, void *aux);
+
+void thread_yield_if_not_highest (void);
+
 struct thread *thread_current (void);
 tid_t thread_tid (void);
 const char *thread_name (void);
