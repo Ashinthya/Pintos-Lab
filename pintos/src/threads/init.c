@@ -64,6 +64,8 @@ static char **read_command_line (void);
 static char **parse_options (char **argv);
 static void run_actions (char **argv);
 static void usage (void);
+static void shell (void);
+static void read_line (char *buffer, int size);
 
 #ifdef FILESYS
 static void locate_block_devices (void);
@@ -133,7 +135,8 @@ pintos_init (void)
     /* Run actions specified on kernel command line. */
     run_actions (argv);
   } else {
-    // TODO: no command line passed to kernel. Run interactively 
+    // TODO: no command line passed to kernel. Run interactively
+    shell ();
   }
 
   /* Finish up. */
@@ -346,6 +349,109 @@ run_actions (char **argv)
     }
   
 }
+
+/* Reads a single line of input from the keyboard into BUFFER,
+   which has room for SIZE characters including the null
+   terminator.  Handles backspace and echoes each character to
+   the console. */
+static void
+read_line (char *buffer, int size)
+{
+  int pos = 0;
+  char c;
+
+  while (true)
+    {
+      c = input_getc ();
+
+      if (c == '\r' || c == '\n')
+        {
+          printf ("\n");
+          break;
+        }
+      else if (c == '\b' || c == 127)
+        {
+          if (pos > 0)
+            {
+              pos--;
+              printf ("\b \b");
+            }
+        }
+      else if (pos < size - 1)
+        {
+          buffer[pos++] = c;
+          printf ("%c", c);
+        }
+    }
+
+  buffer[pos] = '\0';
+}
+
+/* A simplified kernel-mode interactive shell for CS2042. */
+static void
+shell (void)
+{
+  char buffer[128];
+
+  printf ("\n");
+  printf (" ____                           _                       \n");
+  printf ("|  _ \\  __ ___   ___   _       | | ___  _ __   ___  ___ \n");
+  printf ("| | | |/ _` \\ \\ / / | | |   _  | |/ _ \\| '_ \\ / _ \\/ __|\n");
+  printf ("| |_| | (_| |\\ V /| |_| |  | |_| | (_) | | | |  __/\\__ \\\n");
+  printf ("|____/ \\__,_| \\_/  \\__, |___\\___/ \\___/|_| |_|\\___||___/\n");
+  printf ("                   |___/_____|\n");
+  printf ("\n");
+  printf ("            CS2042 Operating Systems Shell\n");
+  printf ("========================================================\n\n");
+  printf ("Type 'exit' to quit.\n\n");
+  while (true)
+    {
+      printf ("D4vY_J0n3$> ");
+      read_line (buffer, sizeof buffer);
+
+      if (strlen (buffer) == 0)
+        {
+          continue;
+        }
+      else if (strcmp (buffer, "whoami") == 0)
+        {
+          printf ("D4vy_J0n3$\n");
+        }
+      else if (strcmp (buffer, "shutdown") == 0)
+        {
+          shutdown_power_off ();
+        }
+      else if (strcmp (buffer, "time") == 0)
+        {
+          printf ("Seconds since epoch: %"PRId64"\n", rtc_get_time ());
+        }
+      else if (strcmp (buffer, "ram") == 0)
+        {
+          printf ("RAM available: %"PRIu32" kB\n",
+                  init_ram_pages * PGSIZE / 1024);
+        }
+      else if (strcmp (buffer, "thread") == 0)
+        {
+          thread_print_stats ();
+        }
+      else if (strcmp (buffer, "priority") == 0)
+        {
+          printf ("Current thread priority: %d\n", thread_get_priority ());
+        }
+      else if (strcmp (buffer, "exit") == 0)
+        {
+          printf ("Exiting shell...\n");
+          break;
+        }
+      else
+        {
+          printf ("Unknown command: '%s'\n", buffer);
+        }
+    }
+}
+
+
+
 
 /* Prints a kernel command line help message and powers off the
    machine. */

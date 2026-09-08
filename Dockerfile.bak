@@ -36,18 +36,18 @@ ENV DEBIAN_FRONTEND=
 COPY pintos/src /pintos/src
 
 # Ensure that the script file has executable permissions
-RUN chmod +x /pintos/src/misc/bochs-2.6.2-build.sh
+#RUN chmod +x /pintos/src/misc/bochs-2.6.2-build.sh
 RUN chmod +x /pintos/src/misc/toolchain-build.sh
 
 # Ensure there are no hidden char. or incorrect line ending
-RUN dos2unix /pintos/src/misc/bochs-2.6.2-build.sh
+#RUN dos2unix /pintos/src/misc/bochs-2.6.2-build.sh
 RUN dos2unix /pintos/src/misc/toolchain-build.sh
 
 # Make toolchain directory
 RUN mkdir -p /pintos/toolchain
 
 # build Bochs from source
-RUN pintos/src/misc/bochs-2.6.2-build.sh /pintos/toolchain/x86_64
+#RUN pintos/src/misc/bochs-2.6.2-build.sh /pintos/toolchain/x86_64
 
 # Build the toolchain with a custom prefix
 RUN /pintos/src/misc/toolchain-build.sh --prefix /pintos/toolchain/x86_64 /pintos/toolchain && \
