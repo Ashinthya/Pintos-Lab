@@ -11,6 +11,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "devices/timer.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -59,7 +60,12 @@ static unsigned thread_ticks;   /* # of timer ticks since last yield. */
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
 
+/* MLFQS system load average (fixed-point). */
+static fixed_t load_avg;
+
 static void kernel_thread (thread_func *, void *aux);
+static int mlfqs_priority (struct thread *t);
+static void mlfqs_tick (struct thread *cur);
 
 static void idle (void *aux UNUSED);
 static struct thread *running_thread (void);
@@ -159,6 +165,9 @@ thread_tick (void)
 #endif
   else
     kernel_ticks++;
+
+  if (thread_mlfqs)
+    mlfqs_tick (t);
 
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
@@ -430,11 +439,85 @@ thread_foreach (thread_action_func *func, void *aux)
 
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void
-thread_set_priority (int new_priority) 
+thread_set_priority (int new_priority)
 {
-  thread_current ()->priority = new_priority;
+  struct thread *cur = thread_current ();
+  enum intr_level old_level;
+
+  if (thread_mlfqs)
+    return;
+
+  /* Only the base priority changes; active donations still apply,
+     so the effective priority never drops below the highest donor. */
+  old_level = intr_disable ();
+  cur->base_priority = new_priority;
+  thread_refresh_priority (cur);
+  intr_set_level (old_level);
 
   thread_yield_if_not_highest ();
+}
+
+/* Maximum depth of nested priority donation. */
+#define DONATION_DEPTH_MAX 8
+
+/* If T is on the ready list, moves it to the right spot for its
+   (changed) priority.  Interrupts must be off. */
+static void
+ready_list_reposition (struct thread *t)
+{
+  if (t->status == THREAD_READY)
+    {
+      list_remove (&t->elem);
+      list_insert_ordered (&ready_list, &t->elem, priority_greater, NULL);
+    }
+}
+
+/* Donates DONOR's priority along the chain of lock holders it is
+   waiting on: the holder of DONOR's lock, the holder of the lock
+   that holder waits on, and so on, up to DONATION_DEPTH_MAX levels.
+   Interrupts must be off. */
+void
+thread_donate_priority (struct thread *donor)
+{
+  struct thread *t = donor;
+  int depth;
+
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  for (depth = 0; depth < DONATION_DEPTH_MAX && t->waiting_lock != NULL;
+       depth++)
+    {
+      struct thread *holder = t->waiting_lock->holder;
+
+      /* Stop once the chain is already high enough. */
+      if (holder == NULL || holder->priority >= t->priority)
+        break;
+
+      holder->priority = t->priority;
+      ready_list_reposition (holder);
+      t = holder;
+    }
+}
+
+/* Recomputes T's effective priority as the maximum of its base
+   priority and the priorities of all threads donating to it.
+   Interrupts must be off. */
+void
+thread_refresh_priority (struct thread *t)
+{
+  struct list_elem *e;
+
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  t->priority = t->base_priority;
+  for (e = list_begin (&t->donations); e != list_end (&t->donations);
+       e = list_next (e))
+    {
+      struct thread *donor = list_entry (e, struct thread, donation_elem);
+      if (donor->priority > t->priority)
+        t->priority = donor->priority;
+    }
+  ready_list_reposition (t);
 }
 
 /* Returns the current thread's priority. */
@@ -446,33 +529,119 @@ thread_get_priority (void)
 
 /* Sets the current thread's nice value to NICE. */
 void
-thread_set_nice (int nice UNUSED) 
+thread_set_nice (int nice)
 {
-  /* Not yet implemented. */
+  struct thread *cur = thread_current ();
+  enum intr_level old_level;
+
+  old_level = intr_disable ();
+  cur->nice = nice;
+  cur->priority = mlfqs_priority (cur);
+  intr_set_level (old_level);
+
+  thread_yield_if_not_highest ();
 }
 
 /* Returns the current thread's nice value. */
 int
-thread_get_nice (void) 
+thread_get_nice (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  return thread_current ()->nice;
 }
 
 /* Returns 100 times the system load average. */
 int
-thread_get_load_avg (void) 
+thread_get_load_avg (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  return FP_TO_INT_NEAREST (FP_MUL_INT (load_avg, 100));
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
 int
-thread_get_recent_cpu (void) 
+thread_get_recent_cpu (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  return FP_TO_INT_NEAREST (FP_MUL_INT (thread_current ()->recent_cpu, 100));
+}
+
+/* Computes T's MLFQS priority:
+   PRI_MAX - (recent_cpu / 4) - (nice * 2), clamped to the valid range. */
+static int
+mlfqs_priority (struct thread *t)
+{
+  int priority = FP_TO_INT_ZERO (FP_SUB (INT_TO_FP (PRI_MAX),
+                                         FP_DIV_INT (t->recent_cpu, 4)))
+                 - t->nice * 2;
+
+  if (priority < PRI_MIN)
+    priority = PRI_MIN;
+  if (priority > PRI_MAX)
+    priority = PRI_MAX;
+  return priority;
+}
+
+/* recent_cpu = (2*load_avg) / (2*load_avg + 1) * recent_cpu + nice. */
+static void
+mlfqs_update_recent_cpu (struct thread *t, void *aux UNUSED)
+{
+  fixed_t twice_load = FP_MUL_INT (load_avg, 2);
+
+  if (t == idle_thread)
+    return;
+  t->recent_cpu = FP_ADD_INT (FP_MUL (FP_DIV (twice_load,
+                                              FP_ADD_INT (twice_load, 1)),
+                                      t->recent_cpu),
+                              t->nice);
+}
+
+static void
+mlfqs_update_priority (struct thread *t, void *aux UNUSED)
+{
+  if (t != idle_thread)
+    t->priority = mlfqs_priority (t);
+}
+
+/* MLFQS bookkeeping done on every timer tick, in interrupt context.
+   Every tick the running thread's recent_cpu grows by one; once per
+   second load_avg and then every recent_cpu are recomputed; every
+   fourth tick priorities are recomputed.
+
+   Priority depends only on recent_cpu and nice.  Between the
+   once-per-second updates only the running thread's recent_cpu
+   changes (and thread_set_nice() recomputes its own priority), so
+   on the other fourth ticks recomputing just the running thread
+   gives the same result as recomputing all of them.  This keeps the
+   interrupt handler short enough not to lose timer ticks. */
+static void
+mlfqs_tick (struct thread *cur)
+{
+  int64_t ticks = timer_ticks ();
+
+  if (cur != idle_thread)
+    cur->recent_cpu = FP_ADD_INT (cur->recent_cpu, 1);
+
+  if (ticks % TIMER_FREQ == 0)
+    {
+      /* load_avg = (59/60)*load_avg + (1/60)*ready_threads, where
+         ready_threads counts the running thread unless it is idle. */
+      int ready_threads = list_size (&ready_list)
+                          + (cur != idle_thread ? 1 : 0);
+      load_avg = FP_ADD (FP_MUL (FP_DIV_INT (INT_TO_FP (59), 60), load_avg),
+                         FP_MUL_INT (FP_DIV_INT (INT_TO_FP (1), 60),
+                                     ready_threads));
+      thread_foreach (mlfqs_update_recent_cpu, NULL);
+      thread_foreach (mlfqs_update_priority, NULL);
+      list_sort (&ready_list, priority_greater, NULL);
+    }
+  else if (ticks % 4 == 0)
+    mlfqs_update_priority (cur, NULL);
+
+  if (ticks % 4 == 0)
+    {
+      if (!list_empty (&ready_list)
+          && list_entry (list_front (&ready_list), struct thread,
+                         elem)->priority > cur->priority)
+        intr_yield_on_return ();
+    }
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -561,7 +730,22 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->base_priority = priority;
+  t->waiting_lock = NULL;
+  list_init (&t->donations);
   t->magic = THREAD_MAGIC;
+
+  /* A new thread inherits nice and recent_cpu from its creator (the
+     initial thread starts at 0).  Under MLFQS the priority argument
+     is ignored and the scheduler's formula decides instead. */
+  struct thread *parent = running_thread ();
+  if (parent != t && is_thread (parent))
+    {
+      t->nice = parent->nice;
+      t->recent_cpu = parent->recent_cpu;
+    }
+  if (thread_mlfqs)
+    t->priority = t->base_priority = mlfqs_priority (t);
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);

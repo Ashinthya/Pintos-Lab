@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/fixed-point.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -87,7 +88,15 @@ struct thread
     enum thread_status status;          /* Thread state. */
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
-    int priority;                       /* Priority. */
+    int priority;                       /* Effective priority (with donations). */
+    int base_priority;                  /* Priority set by the thread itself. */
+
+    struct lock *waiting_lock;          /* Lock this thread is blocked on, or NULL. */
+    struct list donations;              /* Threads donating priority to this one. */
+    struct list_elem donation_elem;     /* Element in a holder's donations list. */
+
+    int nice;                           /* MLFQS niceness, -20..20. */
+    fixed_t recent_cpu;                 /* MLFQS recent CPU usage. */
 
     int64_t wakeup_tick;                /* Tick count when this thread must wake up. */
     struct list_elem allelem;           /* List element for all threads list. */
@@ -128,6 +137,9 @@ void thread_wakeup (int64_t current_ticks);
 bool priority_greater (const struct list_elem *a, const struct list_elem *b, void *aux);
 
 void thread_yield_if_not_highest (void);
+
+void thread_donate_priority (struct thread *donor);
+void thread_refresh_priority (struct thread *t);
 
 struct thread *thread_current (void);
 tid_t thread_tid (void);
