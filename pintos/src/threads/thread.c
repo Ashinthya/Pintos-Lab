@@ -734,6 +734,12 @@ init_thread (struct thread *t, const char *name, int priority)
   t->waiting_lock = NULL;
   list_init (&t->donations);
   t->magic = THREAD_MAGIC;
+#ifdef USERPROG
+  t->exit_status = -1;
+  list_init (&t->children);
+  list_init (&t->fd_list);
+  t->next_fd = 2;
+#endif
 
   /* A new thread inherits nice and recent_cpu from its creator (the
      initial thread starts at 0).  Under MLFQS the priority argument

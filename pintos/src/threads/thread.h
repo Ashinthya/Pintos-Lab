@@ -107,6 +107,14 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    int exit_status;                    /* Status printed and given to parent. */
+    struct list children;               /* child_status of each child process. */
+    struct child_status *self_status;   /* Own status, shared with the parent. */
+    struct file *exec_file;             /* Executable, kept open to deny writes. */
+
+    /* Owned by userprog/syscall.c. */
+    struct list fd_list;                /* Open files (struct file_desc). */
+    int next_fd;                        /* Next file descriptor to hand out. */
 #endif
 
     /* Owned by thread.c. */

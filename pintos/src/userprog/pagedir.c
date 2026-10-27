@@ -167,6 +167,19 @@ pagedir_is_dirty (uint32_t *pd, const void *vpage)
   return pte != NULL && (*pte & PTE_D) != 0;
 }
 
+/* Returns true if user virtual address UADDR is mapped writable
+   in PD, false if it is unmapped or read-only. */
+bool
+pagedir_is_writable (uint32_t *pd, const void *uaddr)
+{
+  uint32_t *pte;
+
+  ASSERT (is_user_vaddr (uaddr));
+
+  pte = lookup_page (pd, uaddr, false);
+  return pte != NULL && (*pte & PTE_P) != 0 && (*pte & PTE_W) != 0;
+}
+
 /* Set the dirty bit to DIRTY in the PTE for virtual page VPAGE
    in PD. */
 void

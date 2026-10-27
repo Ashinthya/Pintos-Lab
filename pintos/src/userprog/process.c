@@ -7,6 +7,7 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -14,56 +15,170 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+/* Maximum number of words on a command line. */
+#define MAX_ARGS 64
+
+/* Handed from process_execute() to the new thread.  Lives on the
+   parent's stack, which is safe because the parent waits on
+   LOADED until the child is done with it. */
+struct load_info
+  {
+    char *cmd_line;                     /* Page holding the command line. */
+    struct child_status *status;        /* Child's shared exit record. */
+    struct semaphore loaded;            /* Upped when loading finishes. */
+    bool success;                       /* Whether loading succeeded. */
+  };
+
+/* Protects child_status reference counts. */
+static struct lock status_lock;
+
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool push_arguments (void **esp, int argc, char **argv);
+
+/* Initializes process bookkeeping.  Called once at boot. */
+void
+process_init (void)
+{
+  lock_init (&status_lock);
+}
+
+/* Drops one reference to STATUS and frees it once neither the
+   parent nor the child needs it any more. */
+static void
+release_child_status (struct child_status *status)
+{
+  int refs;
+
+  lock_acquire (&status_lock);
+  refs = --status->ref_cnt;
+  lock_release (&status_lock);
+
+  if (refs == 0)
+    free (status);
+}
 
 /* Starts a new thread running a user program loaded from
-   FILENAME.  The new thread may be scheduled (and may even exit)
-   before process_execute() returns.  Returns the new process's
-   thread id, or TID_ERROR if the thread cannot be created. */
+   FILE_NAME, a command line of the program name followed by its
+   arguments.  Does not return until the new program has finished
+   loading.  Returns the new process's thread id, or TID_ERROR if
+   the thread cannot be created or the program fails to load. */
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *file_name)
 {
-  char *fn_copy;
+  struct load_info info;
+  struct child_status *status;
+  char name[16];
+  size_t len;
   tid_t tid;
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
+  info.cmd_line = palloc_get_page (0);
+  if (info.cmd_line == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+  strlcpy (info.cmd_line, file_name, PGSIZE);
+
+  /* The thread is named after the program, without arguments, so
+     that exit messages print just the program name. */
+  file_name += strspn (file_name, " ");
+  len = strcspn (file_name, " ");
+  if (len >= sizeof name)
+    len = sizeof name - 1;
+  memcpy (name, file_name, len);
+  name[len] = '\0';
+
+  status = malloc (sizeof *status);
+  if (status == NULL)
+    {
+      palloc_free_page (info.cmd_line);
+      return TID_ERROR;
+    }
+  status->exit_status = -1;
+  sema_init (&status->exited, 0);
+  status->ref_cnt = 2;
+
+  info.status = status;
+  sema_init (&info.loaded, 0);
+  info.success = false;
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (name, PRI_DEFAULT, start_process, &info);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    {
+      palloc_free_page (info.cmd_line);
+      free (status);
+      return TID_ERROR;
+    }
+
+  /* exec() must report a load failure, so wait for the result. */
+  sema_down (&info.loaded);
+  if (!info.success)
+    {
+      release_child_status (status);
+      return TID_ERROR;
+    }
+
+  status->tid = tid;
+  list_push_back (&thread_current ()->children, &status->elem);
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *info_)
 {
-  char *file_name = file_name_;
+  struct load_info *info = info_;
+  char *cmd_line = info->cmd_line;
+  char *argv[MAX_ARGS];
+  int argc = 0;
+  char *token, *save_ptr;
   struct intr_frame if_;
-  bool success;
+  bool success = false;
+
+  thread_current ()->self_status = info->status;
+
+  /* Split the command line into words.  Repeated spaces count as
+     one separator because strtok_r() skips empty tokens. */
+  for (token = strtok_r (cmd_line, " ", &save_ptr); token != NULL;
+       token = strtok_r (NULL, " ", &save_ptr))
+    {
+      if (argc == MAX_ARGS)
+        {
+          argc = 0;             /* Too many arguments: fail the load. */
+          break;
+        }
+      argv[argc++] = token;
+    }
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  if (argc > 0)
+    {
+      lock_acquire (&filesys_lock);
+      success = load (argv[0], &if_.eip, &if_.esp);
+      lock_release (&filesys_lock);
+      if (success)
+        success = push_arguments (&if_.esp, argc, argv);
+    }
+
+  /* Report the result to the parent.  INFO is on the parent's
+     stack, so it must not be touched after this. */
+  info->success = success;
+  sema_up (&info->loaded);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success) 
+  palloc_free_page (cmd_line);
+  if (!success)
     thread_exit ();
 
   /* Start the user process by simulating a return from an
@@ -81,13 +196,28 @@ start_process (void *file_name_)
    exception), returns -1.  If TID is invalid or if it was not a
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
-   immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+   immediately, without waiting. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid)
 {
+  struct list *children = &thread_current ()->children;
+  struct list_elem *e;
+
+  for (e = list_begin (children); e != list_end (children); e = list_next (e))
+    {
+      struct child_status *status = list_entry (e, struct child_status, elem);
+      if (status->tid == child_tid)
+        {
+          int exit_status;
+
+          /* Removing it first makes a second wait() return -1. */
+          list_remove (e);
+          sema_down (&status->exited);
+          exit_status = status->exit_status;
+          release_child_status (status);
+          return exit_status;
+        }
+    }
   return -1;
 }
 
@@ -97,6 +227,37 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  /* Only user processes print a termination message. */
+  if (cur->pagedir != NULL)
+    printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
+
+  /* Close open files, including the executable, which allows
+     writes to it again. */
+  syscall_close_files ();
+  if (cur->exec_file != NULL)
+    {
+      lock_acquire (&filesys_lock);
+      file_close (cur->exec_file);
+      lock_release (&filesys_lock);
+      cur->exec_file = NULL;
+    }
+
+  /* Children no longer need to report to us. */
+  while (!list_empty (&cur->children))
+    {
+      struct list_elem *e = list_pop_front (&cur->children);
+      release_child_status (list_entry (e, struct child_status, elem));
+    }
+
+  /* Hand our exit status to the parent and wake it if waiting. */
+  if (cur->self_status != NULL)
+    {
+      cur->self_status->exit_status = cur->exit_status;
+      sema_up (&cur->self_status->exited);
+      release_child_status (cur->self_status);
+      cur->self_status = NULL;
+    }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -311,9 +472,71 @@ load (const char *file_name, void (**eip) (void), void **esp)
   success = true;
 
  done:
-  /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  /* We arrive here whether the load is successful or not.  On
+     success the executable stays open with writes denied until
+     the process exits. */
+  if (success)
+    {
+      file_deny_write (file);
+      t->exec_file = file;
+    }
+  else
+    file_close (file);
   return success;
+}
+
+/* Pushes the program arguments onto the new user stack at *ESP
+   following the 80x86 calling convention: the strings, padding to
+   a word boundary, argv[argc] = NULL, argv[argc-1] .. argv[0],
+   argv, argc, and a fake return address.  ARGV's entries are
+   overwritten with the user addresses of the copied strings.
+   Returns false if everything does not fit in the stack page. */
+static bool
+push_arguments (void **esp, int argc, char **argv)
+{
+  uint8_t *sp = *esp;
+  size_t size = 0;
+  int i;
+
+  /* Make sure strings, padding and pointers fit in one page. */
+  for (i = 0; i < argc; i++)
+    size += strlen (argv[i]) + 1;
+  size += sizeof (uint32_t) - 1                    /* Padding. */
+          + (argc + 1) * sizeof (char *)            /* argv[] + NULL. */
+          + sizeof (char **) + sizeof (int)         /* argv, argc. */
+          + sizeof (void *);                        /* Return address. */
+  if (size > PGSIZE)
+    return false;
+
+  /* Strings, last argument first. */
+  for (i = argc - 1; i >= 0; i--)
+    {
+      size_t len = strlen (argv[i]) + 1;
+      sp -= len;
+      memcpy (sp, argv[i], len);
+      argv[i] = (char *) sp;
+    }
+
+  /* Word-align, then argv[argc] = NULL and the argv[] pointers. */
+  sp -= (uintptr_t) sp % sizeof (uint32_t);
+  sp -= sizeof (char *);
+  *(char **) sp = NULL;
+  for (i = argc - 1; i >= 0; i--)
+    {
+      sp -= sizeof (char *);
+      *(char **) sp = argv[i];
+    }
+
+  /* argv, argc, and a fake return address. */
+  sp -= sizeof (char **);
+  *(char ***) sp = (char **) (sp + sizeof (char **));
+  sp -= sizeof (int);
+  *(int *) sp = argc;
+  sp -= sizeof (void *);
+  *(void **) sp = NULL;
+
+  *esp = sp;
+  return true;
 }
 
 /* load() helpers. */
